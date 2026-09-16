@@ -27,7 +27,33 @@ VLAN_BRIDGE_GUEST="br-vlan${VLAN_GUEST}"
 WIFI_NETWORK_MGMT="vlan${VLAN_MGMT}"
 WIFI_NETWORK_GUEST="vlan${VLAN_GUEST}"
 
-PHY_PORTS="wan lan1 lan2 lan3"
+# [FIX] 动态探测物理端口，避免硬编码
+detect_phy_ports() {
+    local ports=""
+    for p in wan lan1 lan2 lan3 eth0 eth1; do
+        if [ -d "/sys/class/net/$p" ] && [ ! -e "/sys/class/net/$p/phy80211" ]; then
+            # 排除无线接口和已存在的 vlan/bridge
+            case "$p" in
+                br-*|*.|*.*) continue ;;
+            esac
+            ports="$ports $p"
+        fi
+    done
+    echo "$ports" | sed 's/^ //'
+}
+
+# 优先使用 UCI 中已配置的 lan 设备名，回退到硬编码
+get_lan_ports() {
+    local dev
+    dev=$(uci -q get network.@device[0].ports 2>/dev/null)
+    if [ -n "$dev" ]; then
+        echo "$dev"
+    else
+        echo "wan lan1 lan2 lan3"
+    fi
+}
+
+PHY_PORTS="$(get_lan_ports)"
 
 log_info() { echo "[INFO] $*"; }
 log_error() { echo "[ERROR] $*" >&2; }
@@ -40,19 +66,15 @@ configure_conntrack() {
     local sysctl_conf="/etc/sysctl.conf"
     local conf_key="net.netfilter.nf_conntrack_max"
 
-    if ! sysctl -n "$conf_key" >/dev/null 2>&1; then
+    current_value=$(sysctl -n "$conf_key" 2>/dev/null)
+
+    # [FIX] 去掉冗余的 sysctl 判断，直接用空值检测
+    if [ -z "$current_value" ]; then
         log_error "系统不支持 $conf_key 参数，跳过配置"
         return 1
     fi
 
-    current_value=$(sysctl -n "$conf_key" 2>/dev/null)
-
-    if [ -z "$current_value" ] || ! [ "$current_value" -gt 0 ] 2>/dev/null; then
-        log_error "无法获取有效的 $conf_key 当前值"
-        return 1
-    fi
-
-    if [ "$current_value" -ge "$CONNTRACK_MAX" ]; then
+    if [ "$current_value" -ge "$CONNTRACK_MAX" ] 2>/dev/null; then
         log_info "nf_conntrack_max 当前值 ($current_value) 已满足要求"
         return 0
     fi
@@ -79,6 +101,7 @@ configure_conntrack() {
 #-------------------------------------------------------------------------------
 configure_dropbear() {
     local config_section="$DROPBEAR_CONFIG"
+    local config_file="dropbear"        # [FIX] uci commit 需要的是配置文件名
 
     if ! uci show "$config_section" >/dev/null 2>&1; then
         log_error "dropbear 配置不存在，跳过"
@@ -93,7 +116,8 @@ configure_dropbear() {
     log_info "正在解除 dropbear DirectInterface 访问限制..."
 
     if uci delete "${config_section}.DirectInterface" 2>/dev/null; then
-        if uci commit "$config_section" 2>/dev/null; then
+        # [FIX] commit 配置文件名，不是段名
+        if uci commit "$config_file" 2>/dev/null; then
             if /etc/init.d/dropbear restart >/dev/null 2>&1; then
                 log_info "dropbear 访问限制已解除，服务已重启"
                 return 0
@@ -120,9 +144,31 @@ configure_network_optimization() {
     log_info "正在应用 AP 模式网络优化配置..."
 
     if [ -f "$sysctl_conf" ]; then
-        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout/d' "$sysctl_conf"
-        sed -i '/^net\.ipv4\.tcp_/d' "$sysctl_conf"
-        sed -i '/^net\.core\./d' "$sysctl_conf"
+        # [FIX] 只删除明确要覆盖的键，避免误删其他配置
+        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout_established/d' "$sysctl_conf"
+        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout_syn_recv/d' "$sysctl_conf"
+        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout_syn_sent/d' "$sysctl_conf"
+        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout_fin_wait/d' "$sysctl_conf"
+        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout_close_wait/d' "$sysctl_conf"
+        sed -i '/^net\.netfilter\.nf_conntrack_tcp_timeout_time_wait/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_congestion_control/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_fastopen/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_fin_timeout/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_keepalive_time/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_keepalive_probes/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_keepalive_intvl/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_tw_reuse/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_max_tw_buckets/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_rmem/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_wmem/d' "$sysctl_conf"
+        sed -i '/^net\.core\.rmem_default/d' "$sysctl_conf"
+        sed -i '/^net\.core\.wmem_default/d' "$sysctl_conf"
+        sed -i '/^net\.core\.rmem_max/d' "$sysctl_conf"
+        sed -i '/^net\.core\.wmem_max/d' "$sysctl_conf"
+        sed -i '/^net\.core\.netdev_max_backlog/d' "$sysctl_conf"
+        sed -i '/^net\.core\.somaxconn/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.ip_local_port_range/d' "$sysctl_conf"
+        sed -i '/^net\.ipv4\.tcp_max_syn_backlog/d' "$sysctl_conf"
     fi
 
     cat >> "$sysctl_conf" << 'EOF'
@@ -170,25 +216,34 @@ EOF
 # 彻底禁用防火墙
 #-------------------------------------------------------------------------------
 disable_firewall() {
-    log_info "正在彻底禁用防火墙（AP 模式）..."
+    log_info "正在禁用防火墙（AP 模式）..."
 
     /etc/init.d/firewall stop 2>/dev/null
     /etc/init.d/firewall disable 2>/dev/null
     /etc/init.d/firewall4 stop 2>/dev/null
     /etc/init.d/firewall4 disable 2>/dev/null
 
+    # [FIX] 只禁用不删除，保留固件完整性；保留空的 firewall 配置
     rm -f /etc/rc.d/S??firewall
     rm -f /etc/rc.d/K??firewall
-    rm -f /etc/init.d/firewall
-    rm -f /etc/init.d/firewall4
-    rm -f /etc/config/firewall
+    rm -f /etc/rc.d/S??firewall4
+    rm -f /etc/rc.d/K??firewall4
+
+    # [FIX] 用全放行配置替代删除 /etc/config/firewall
+    cat > /etc/config/firewall << 'EOF'
+config defaults
+    option input 'ACCEPT'
+    option output 'ACCEPT'
+    option forward 'ACCEPT'
+    option syn_flood '0'
+EOF
 
     iptables -F 2>/dev/null
     iptables -t nat -F 2>/dev/null
     iptables -t mangle -F 2>/dev/null
     nft flush ruleset 2>/dev/null
 
-    log_info "防火墙已彻底禁用"
+    log_info "防火墙已禁用（保留全放行配置）"
 }
 
 #-------------------------------------------------------------------------------
@@ -197,57 +252,52 @@ disable_firewall() {
 configure_vlan() {
     log_info "正在配置 802.1Q VLAN（三 VLAN）..."
     log_info "管理 VLAN: $VLAN_MGMT, 业务 VLAN: $VLAN_BUS, 访客 VLAN: $VLAN_GUEST"
+    log_info "物理端口: $PHY_PORTS"
 
-    uci del 'network.@device[0].vlan_filtering' 2>/dev/null
-    uci delete network.vlan233 2>/dev/null
-    uci delete network.vlan100 2>/dev/null
-    uci delete network.vlan200 2>/dev/null
-    uci delete network.br-vlan233 2>/dev/null
-    uci delete network.br-vlan100 2>/dev/null
-    uci delete network.br-vlan200 2>/dev/null
-
-    for port in $PHY_PORTS; do
-        uci set network.${port}_vlan233="device"
-        uci set network.${port}_vlan233.name="${port}.${VLAN_MGMT}"
-        uci set network.${port}_vlan233.type="8021q"
-        uci set network.${port}_vlan233.ifname="${port}"
-        uci set network.${port}_vlan233.vid="${VLAN_MGMT}"
-
-        uci set network.${port}_vlan100="device"
-        uci set network.${port}_vlan100.name="${port}.${VLAN_BUS}"
-        uci set network.${port}_vlan100.type="8021q"
-        uci set network.${port}_vlan100.ifname="${port}"
-        uci set network.${port}_vlan100.vid="${VLAN_BUS}"
-
-        uci set network.${port}_vlan200="device"
-        uci set network.${port}_vlan200.name="${port}.${VLAN_GUEST}"
-        uci set network.${port}_vlan200.type="8021q"
-        uci set network.${port}_vlan200.ifname="${port}"
-        uci set network.${port}_vlan200.vid="${VLAN_GUEST}"
+    # 清理旧配置
+    uci -q del 'network.@device[0].vlan_filtering' 2>/dev/null
+    for v in "$VLAN_MGMT" "$VLAN_BUS" "$VLAN_GUEST"; do
+        uci -q delete "network.vlan${v}" 2>/dev/null
+        uci -q delete "network.br-vlan${v}" 2>/dev/null
     done
 
+    # 创建 8021q 子接口设备
+    for port in $PHY_PORTS; do
+        for v in "$VLAN_MGMT" "$VLAN_BUS" "$VLAN_GUEST"; do
+            uci set "network.${port}_vlan${v}=device"
+            uci set "network.${port}_vlan${v}.name=${port}.${v}"
+            uci set "network.${port}_vlan${v}.type=8021q"
+            uci set "network.${port}_vlan${v}.ifname=${port}"
+            uci set "network.${port}_vlan${v}.vid=${v}"
+        done
+    done
+
+    # [FIX] 网桥 ports 引用 UCI device 段名（${port}_vlan${v}），而非 netdev 名（${port}.${v}）
     uci set network."${VLAN_BRIDGE_MGMT}"="device"
     uci set network."${VLAN_BRIDGE_MGMT}".name="${VLAN_BRIDGE_MGMT}"
     uci set network."${VLAN_BRIDGE_MGMT}".type="bridge"
     for port in $PHY_PORTS; do
-        uci add_list network."${VLAN_BRIDGE_MGMT}".ports="${port}.${VLAN_MGMT}"
+        uci add_list network."${VLAN_BRIDGE_MGMT}".ports="${port}_vlan${VLAN_MGMT}"
     done
 
     uci set network."${VLAN_BRIDGE_BUS}"="device"
     uci set network."${VLAN_BRIDGE_BUS}".name="${VLAN_BRIDGE_BUS}"
     uci set network."${VLAN_BRIDGE_BUS}".type="bridge"
     for port in $PHY_PORTS; do
-        uci add_list network."${VLAN_BRIDGE_BUS}".ports="${port}.${VLAN_BUS}"
+        uci add_list network."${VLAN_BRIDGE_BUS}".ports="${port}_vlan${VLAN_BUS}"
     done
 
     uci set network."${VLAN_BRIDGE_GUEST}"="device"
     uci set network."${VLAN_BRIDGE_GUEST}".name="${VLAN_BRIDGE_GUEST}"
     uci set network."${VLAN_BRIDGE_GUEST}".type="bridge"
     for port in $PHY_PORTS; do
-        uci add_list network."${VLAN_BRIDGE_GUEST}".ports="${port}.${VLAN_GUEST}"
+        uci add_list network."${VLAN_BRIDGE_GUEST}".ports="${port}_vlan${VLAN_GUEST}"
     done
 
     uci set network.lan.device="${VLAN_BRIDGE_MGMT}"
+
+    # [FIX] 本函数内 commit，避免依赖后续函数
+    uci commit network
 
     log_info "三 VLAN 配置完成"
 }
@@ -260,7 +310,7 @@ configure_wifi() {
     log_info "管理 WiFi -> VLAN $VLAN_MGMT, 访客 WiFi -> VLAN $VLAN_GUEST"
 
     local iface_count=0
-    while uci get wireless.@wifi-iface[$iface_count] >/dev/null 2>&1; do
+    while uci get "wireless.@wifi-iface[$iface_count]" >/dev/null 2>&1; do
         iface_count=$((iface_count + 1))
     done
 
@@ -269,17 +319,45 @@ configure_wifi() {
         return 1
     fi
 
+    # [FIX] 按 band 分组：每个 band 的第一个接口作为管理，其余作为访客
+    # 这样不依赖接口序号，避免顺序变化导致分配错误
+    local band_list=""
     local i=0
-    local count=0
     while [ $i -lt $iface_count ]; do
-        if [ $count -lt 2 ]; then
-            uci set wireless.@wifi-iface[$i].network="${WIFI_NETWORK_MGMT}" 2>/dev/null
-            log_info "WiFi 接口 $i: 绑定到 ${WIFI_NETWORK_MGMT}（管理）"
-        else
-            uci set wireless.@wifi-iface[$i].network="${WIFI_NETWORK_GUEST}" 2>/dev/null
-            log_info "WiFi 接口 $i: 绑定到 ${WIFI_NETWORK_GUEST}（访客）"
-        fi
-        count=$((count + 1))
+        local band
+        band=$(uci -q get "wireless.@wifi-iface[$i].band" 2>/dev/null)
+        [ -z "$band" ] && band="unknown"
+
+        # 检查该 band 是否已处理过
+        case " $band_list " in
+            *" $band "*) ;;   # 已处理，跳过
+            *)
+                band_list="$band_list $band"
+                ;;
+        esac
+        i=$((i + 1))
+    done
+
+    # 每个 band 的第一个 wifi-iface 设为主网络（管理），其余设为访客
+    local seen_bands=""
+    i=0
+    while [ $i -lt $iface_count ]; do
+        local band
+        band=$(uci -q get "wireless.@wifi-iface[$i].band" 2>/dev/null)
+        [ -z "$band" ] && band="unknown"
+
+        case " $seen_bands " in
+            *" $band "*)
+                # 该 band 已出现，作为访客网络
+                uci set "wireless.@wifi-iface[$i].network=${WIFI_NETWORK_GUEST}" 2>/dev/null
+                log_info "WiFi 接口 $i (band=$band): 绑定到 ${WIFI_NETWORK_GUEST}（访客）"
+                ;;
+            *)
+                seen_bands="$seen_bands $band"
+                uci set "wireless.@wifi-iface[$i].network=${WIFI_NETWORK_MGMT}" 2>/dev/null
+                log_info "WiFi 接口 $i (band=$band): 绑定到 ${WIFI_NETWORK_MGMT}（管理）"
+                ;;
+        esac
         i=$((i + 1))
     done
 
@@ -295,9 +373,6 @@ configure_ap_network() {
     log_info "LAN IP: $LAN_IP/$LAN_NETMASK"
     log_info "网关: $LAN_GATEWAY"
     log_info "DNS: $LAN_DNS"
-    log_info "管理 VLAN: $VLAN_MGMT (网桥: $VLAN_BRIDGE_MGMT)"
-    log_info "业务 VLAN: $VLAN_BUS (网桥: $VLAN_BRIDGE_BUS)"
-    log_info "访客 VLAN: $VLAN_GUEST (网桥: $VLAN_BRIDGE_GUEST)"
 
     uci set network.lan.proto='static'
     uci set network.lan.ipaddr="$LAN_IP"
@@ -309,16 +384,14 @@ configure_ap_network() {
     uci set dhcp.lan.dhcpv4='disabled'
     uci set dhcp.lan.dhcpv6='disabled'
 
-    uci delete network.wan 2>/dev/null
-    uci delete network.wan6 2>/dev/null
+    uci -q delete network.wan 2>/dev/null
+    uci -q delete network.wan6 2>/dev/null
 
     uci commit network
     uci commit dhcp
 
-    cat > /etc/resolv.conf << EOF
-nameserver 223.5.5.5
-nameserver 119.29.29.29
-EOF
+    # [FIX] 不再直接覆盖 resolv.conf，AP 模式下由 dnsmasq 管理
+    # 如需静态 DNS，可通过 network.lan.dns（已设置）
 
     log_info "AP 网络配置完成"
 }
@@ -334,7 +407,8 @@ configure_lldpd() {
         return 0
     fi
 
-    cat > /etc/config/lldpd << 'EOF'
+    # [FIX] 使用变量展开，让 lldp_mgmt_ip 跟随 LAN_IP
+    cat > /etc/config/lldpd << EOF
 config lldpd 'config'
     option enabled '1'
     option lldp_tx_interval '30'
@@ -353,7 +427,7 @@ config lldpd 'config'
     option force_fdp '1'
     option force_edp '1'
     option force_sonmp '1'
-    option lldp_mgmt_ip '192.168.2.253'
+    option lldp_mgmt_ip '${LAN_IP}'
 EOF
 
     /etc/init.d/lldpd start 2>/dev/null
@@ -363,31 +437,41 @@ EOF
 }
 
 #-------------------------------------------------------------------------------
-# 激活所有 VLAN 接口（解决接口 DOWN 问题）
+# 激活所有 VLAN 接口
 #-------------------------------------------------------------------------------
 activate_interfaces() {
     log_info "激活所有 VLAN 接口..."
 
-    sleep 3
-
-    for port in wan lan1 lan2 lan3; do
-        ip link set "$port" up 2>/dev/null
-        log_info "启用 $port"
+    # [FIX] 轮询等待接口出现，替代固定 sleep
+    local retry=0
+    while [ $retry -lt 15 ]; do
+        if ip link show "${VLAN_BRIDGE_MGMT}" >/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+        retry=$((retry + 1))
     done
 
-    for port in wan lan1 lan2 lan3; do
-        for vlan in 233 100 200; do
-            ip link set "${port}.${vlan}" up 2>/dev/null
+    if ! ip link show "${VLAN_BRIDGE_MGMT}" >/dev/null 2>&1; then
+        log_error "网桥 ${VLAN_BRIDGE_MGMT} 未创建，VLAN 配置可能失败"
+    fi
+
+    for port in $PHY_PORTS; do
+        ip link set "$port" up 2>/dev/null && log_info "启用 $port"
+    done
+
+    for port in $PHY_PORTS; do
+        for v in "$VLAN_MGMT" "$VLAN_BUS" "$VLAN_GUEST"; do
+            ip link set "${port}.${v}" up 2>/dev/null
         done
     done
     log_info "VLAN 子接口已启用"
 
-    ip link set br-vlan233 up 2>/dev/null
-    ip link set br-vlan100 up 2>/dev/null
-    ip link set br-vlan200 up 2>/dev/null
-    log_info "网桥已启用"
+    for br in "${VLAN_BRIDGE_MGMT}" "${VLAN_BRIDGE_BUS}" "${VLAN_BRIDGE_GUEST}"; do
+        ip link set "$br" up 2>/dev/null && log_info "网桥 $br 已启用"
+    done
 
-    route add default gw 192.168.2.254 2>/dev/null || true
+    # [FIX] 默认路由由 UCI network.lan.gateway 提供，不再手动 route add
 
     log_info "所有接口已激活"
 }
@@ -398,14 +482,14 @@ activate_interfaces() {
 main() {
     log_info "开始应用 AP 定制配置（三 VLAN）..."
 
-    configure_conntrack
-    configure_dropbear
-    configure_network_optimization
-    disable_firewall
-    configure_vlan
-    configure_wifi
-    configure_ap_network
-    configure_lldpd
+    configure_conntrack    || log_error "conntrack 配置失败"
+    configure_dropbear     || log_error "dropbear 配置失败"
+    configure_network_optimization || log_error "网络优化配置失败"
+    disable_firewall       || log_error "防火墙禁用失败"
+    configure_vlan         || log_error "VLAN 配置失败"
+    configure_wifi         || log_error "WiFi 配置失败"
+    configure_ap_network   || log_error "AP 网络配置失败"
+    configure_lldpd        || log_error "lldpd 配置失败"
 
     /etc/init.d/network restart
 
